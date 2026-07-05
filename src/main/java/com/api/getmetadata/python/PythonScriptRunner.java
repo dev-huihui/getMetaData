@@ -61,6 +61,10 @@ public class PythonScriptRunner {
     public String run(String jsonInput) {
         ProcessBuilder pb = new ProcessBuilder(properties.getCommand(), scriptPath.toString());
         pb.redirectErrorStream(false);
+        // Windows 의 Python 은 stdin/stdout 기본 인코딩이 콘솔 코드페이지(예: cp949)라
+        // 한글이 깨진다. Java 는 UTF-8 로 주고받으므로 Python I/O 도 UTF-8 로 강제한다.
+        pb.environment().put("PYTHONIOENCODING", "utf-8");
+        pb.environment().put("PYTHONUTF8", "1");
 
         Process process = null;
         try {
