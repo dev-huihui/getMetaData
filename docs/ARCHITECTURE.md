@@ -4,7 +4,37 @@ getMetaData 는 **메일 헤더 / URL 에서 메타데이터를 추출**하는 R
 요청 수신·검증·응답은 **Spring Boot(Java)** 가 담당하고, 실제 파싱은 **Python 표준 라이브러리 스크립트**가 수행합니다.
 Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(JSON)` 파이프로 통신합니다.
 
+> **이 문서는 "왜 이렇게 만들었는가"를 설명합니다.** 설치·실행·API 사용법은 [README.md](../README.md) 를 참고하세요.
+
+**읽는 순서 가이드**
+
+| 알고 싶은 것 | 볼 곳 |
+| --- | --- |
+| 전체 그림과 각 클래스의 역할 | 1부 — 시스템 구조 (§1~§3) |
+| Java↔Python 이 어떻게/왜 이렇게 통신하는가 | 2부 — 핵심 설계 (§4~§5) |
+| 이 설계의 장단점과, 다르게 만들었다면 어땠을까 | 3부 — 설계 평가 (§6~§7) |
+| 오류 처리·실행 환경·앞으로의 확장 | 4부 — 운영과 확장 (§8~§10) |
+
+**목차**
+
+- **1부. 시스템 구조**
+  - [1. 전체 구조](#1-전체-구조)
+  - [2. 계층별 책임](#2-계층별-책임)
+  - [3. 요청 처리 흐름](#3-요청-처리-흐름)
+- **2부. 핵심 설계**
+  - [4. Java ↔ Python 통신 설계](#4-java--python-통신-설계)
+  - [5. 설계상 중요한 결정 두 가지](#5-설계상-중요한-결정-두-가지)
+- **3부. 설계 평가**
+  - [6. 설계 장단점 (Trade-offs)](#6-설계-장단점-trade-offs)
+  - [7. 대안 아키텍처 비교 (현재 버전 vs 다른 방향)](#7-대안-아키텍처-비교-현재-버전-vs-다른-방향)
+- **4부. 운영과 확장**
+  - [8. 오류 처리](#8-오류-처리)
+  - [9. 실행 요구사항 (환경)](#9-실행-요구사항-환경)
+  - [10. 확장 포인트](#10-확장-포인트)
+
 ---
+
+# 1부. 시스템 구조
 
 ## 1. 전체 구조
 
@@ -36,7 +66,7 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
                                                 (다시 Service → Controller → 응답)
 ```
 
----
+한 문장으로: **웹 UI/외부 클라이언트 → Spring Boot(수문장) → Python 스크립트(추출 엔진) → 원본 JSON 그대로 응답.**
 
 ## 2. 계층별 책임
 
@@ -53,8 +83,6 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 | | `config/JacksonConfig` | Jackson 2 용 `ObjectMapper` 빈 제공 |
 | | `dto/ExtractRequest` | URL 요청 본문(`{"value": "..."}`) |
 
----
-
 ## 3. 요청 처리 흐름
 
 ### 3-1. 메일 헤더 추출 `POST /api/metadata/mail-header`
@@ -66,7 +94,7 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
    - `{"type":"mail_header","value":"..."}` 요청 JSON 조립
 4. `PythonScriptRunner.run()` 이 Python 프로세스 실행 후 요청 JSON 을 stdin 으로 전달
 5. `extractor.py` 가 `email` 표준 모듈로 헤더 파싱 → 결과 JSON 을 stdout 으로 출력
-6. Service 가 응답의 `success` 여부만 검증하고 **원본 JSON 문자열을 그대로 반환**
+6. Service 가 응답의 `success` 여부만 검증하고 **원본 JSON 문자열을 그대로 반환** (→ §5-1)
 7. Controller 가 `application/json` 으로 응답
 
 ### 3-2. URL 추출 `POST /api/metadata/url`
@@ -91,11 +119,14 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 
 ---
 
+# 2부. 핵심 설계
+
 ## 4. Java ↔ Python 통신 설계
 
 ### 왜 프로세스 실행 방식인가
 - 파싱 로직(메일/HTML)을 Python 표준 라이브러리로 간결하게 구현하기 위함
 - 별도 서버·네트워크 포트 없이 **한 방향 요청/응답**만 필요하므로 stdin/stdout 파이프가 가장 단순
+- (이 선택의 장단점과 대안은 §6-1, §7-1 에서 평가)
 
 ### 통신 규약
 ```
@@ -110,32 +141,38 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 - **stderr 별도 스레드 소비**: 파이프 버퍼가 가득 차 프로세스가 멈추는(deadlock) 상황 방지.
 - **타임아웃**: `app.python.timeout-seconds`(기본 30초) 초과 시 `destroyForcibly()`.
 - **비정상 종료 처리**: exit code ≠ 0 이고 stdout 이 비면 `PythonExecutionException`.
-
----
+- **I/O 인코딩 고정**: `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1` 환경변수 설정 (→ §5-2).
 
 ## 5. 설계상 중요한 결정 두 가지
 
 이 프로젝트를 Spring Boot 4 + Windows 환경에서 실행하며 드러난, 반드시 알아야 할 두 지점입니다.
+(각각의 장단점 평가는 §6-2, §6-3 참고)
 
 ### 5-1. 응답을 "파싱된 트리"가 아닌 "원본 JSON 문자열"로 반환
-- Spring Boot 4 부터 기본 JSON 라이브러리가 **Jackson 3(`tools.jackson`)** 으로 변경됨.
-- 서비스 계층은 Jackson 2(`com.fasterxml.jackson`) API 로 작성되어 있어,
+
+- **문제**: Spring Boot 4 부터 기본 JSON 라이브러리가 **Jackson 3(`tools.jackson`)** 으로 변경됨.
+  서비스 계층은 Jackson 2(`com.fasterxml.jackson`) API 로 작성되어 있어,
   컨트롤러가 Jackson 2 의 `JsonNode` 를 반환하면 Jackson 3 HTTP 컨버터가 이를 **트리로 인식하지 못하고
   게터 기반 POJO 로 직렬화**(`{"array":false,"object":true,...}`)하는 문제가 발생.
-- 해결: 서비스가 Python 응답의 `success` 만 검증한 뒤 **원본 JSON 문자열을 그대로 반환**하고,
+- **해결**: 서비스가 Python 응답의 `success` 만 검증한 뒤 **원본 JSON 문자열을 그대로 반환**하고,
   컨트롤러는 `String`(`produces=application/json`)으로 응답. 직렬화 라이브러리에 무관하게 정확한 JSON 전달.
 - Jackson 2 `ObjectMapper` 는 내부 검증/요청 조립용으로만 사용하며 `JacksonConfig` 에서 빈으로 등록.
 
 ### 5-2. Python 프로세스 I/O 를 UTF-8 로 강제
-- Windows 의 Python 은 stdin/stdout 기본 인코딩이 콘솔 코드페이지(예: cp949).
-- Java 는 UTF-8 로 읽고 쓰므로, 그대로 두면 한글 등 멀티바이트 문자가 깨짐(U+FFFD 대체문자).
-- 해결: `PythonScriptRunner` 가 프로세스 환경변수에 `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1` 설정.
+
+- **문제**: Windows 의 Python 은 stdin/stdout 기본 인코딩이 콘솔 코드페이지(예: cp949).
+  Java 는 UTF-8 로 읽고 쓰므로, 그대로 두면 한글 등 멀티바이트 문자가 깨짐(U+FFFD 대체문자).
+- **해결**: `PythonScriptRunner` 가 프로세스 환경변수에 `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1` 설정.
+  `pom.xml` 에도 소스/빌드 인코딩을 UTF-8 로 명시.
 
 ---
+
+# 3부. 설계 평가
 
 ## 6. 설계 장단점 (Trade-offs)
 
 각 핵심 설계 결정의 장점과 단점, 그리고 대안입니다.
+(대안들의 정량적 비교는 §7 의 비교표 참고)
 
 ### 6-1. Java ↔ Python 을 "프로세스 실행 + stdin/stdout" 으로 연동
 
@@ -149,7 +186,7 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 - 런타임에 **Python 설치·PATH 의존**. 환경에 따라 `command` 설정 필요, 배포 환경 제약.
 - 프로세스 경계(인코딩, 타임아웃, 좀비 프로세스, stderr 버퍼)를 직접 관리해야 함.
 
-**대안** — 순수 Java 라이브러리(Jsoup, Jakarta Mail)로 재구현 / 상주 Python 워커(소켓·gRPC) / 별도 마이크로서비스.
+**대안** — 순수 Java 라이브러리(Jsoup, Jakarta Mail)로 재구현 / 상주 Python 워커(소켓·gRPC) / 별도 마이크로서비스. (→ §7-1)
 
 ### 6-2. 응답을 "파싱된 트리" 대신 "원본 JSON 문자열" 로 반환
 
@@ -164,7 +201,7 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 - Python 이 잘못된 JSON 을 내보내면 `success` 검증은 통과해도 클라이언트로 그대로 나갈 여지가 있음
   (현재는 `readTree` 파싱으로 최소 검증).
 
-**대안** — DTO 로 매핑해 반환(스키마 명시·가공 용이하나 매핑 비용/유지보수 증가) / Jackson 3 로 전면 이관.
+**대안** — DTO 로 매핑해 반환(스키마 명시·가공 용이하나 매핑 비용/유지보수 증가) / Jackson 3 로 전면 이관. (→ §7-2)
 
 ### 6-3. Jackson 2 를 유지 (Jackson 3 로 이관하지 않음)
 
@@ -201,8 +238,6 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 - 입력 검증·i18n·접근성 등은 직접 구현해야 함.
 
 **대안** — SPA(React/Vue 등) 분리 / 서버사이드 템플릿(Thymeleaf).
-
----
 
 ## 7. 대안 아키텍처 비교 (현재 버전 vs 다른 방향)
 
@@ -241,6 +276,8 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 
 ---
 
+# 4부. 운영과 확장
+
 ## 8. 오류 처리
 
 `GlobalExceptionHandler` 가 예외를 일관된 JSON 으로 변환합니다.
@@ -255,8 +292,6 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 { "success": false, "status": 400, "error": "입력 값(value)이 비어 있습니다." }
 ```
 
----
-
 ## 9. 실행 요구사항 (환경)
 
 - **JDK 21** — 코드가 `record` 등 Java 16+ 문법 사용.
@@ -264,8 +299,7 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
   (JDK 8 이면 `record` 컴파일 실패: *"class, interface, or enum expected"*).
 - **Python 3** — PATH 에 등록되어 있어야 함(`app.python.command` 로 명령어 변경 가능).
 - 실행: `mvnw.cmd spring-boot:run` (Windows) / `./mvnw spring-boot:run` (macOS·Linux), 기본 포트 `8080`.
-
----
+- 실행/트러블슈팅 상세는 [README.md](../README.md) 참고.
 
 ## 10. 확장 포인트
 
@@ -273,3 +307,4 @@ Java 와 Python 은 `ProcessBuilder` 기반 프로세스 실행 + `stdin/stdout(
 - **Python 실행 환경 변경**: `application.properties` 의 `app.python.*`(명령어/타임아웃/스크립트 경로).
 - **성능**: 요청마다 Python 프로세스를 새로 띄우므로, 고빈도 트래픽에서는
   프로세스 풀 또는 장기 실행 워커(예: 상주 프로세스 + 요청 스트리밍) 도입을 고려.
+  (진화 경로는 §7-1 비교표 참고)
